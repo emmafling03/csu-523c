@@ -24,6 +24,8 @@ website:
     left:
       - href: index.qmd
         text: Home
+      - lab1.qmd
+      - lab2.qmd
     right:
       - icon: github
         href: https://github.com/mikejohnson51/csu-523c-2026/
