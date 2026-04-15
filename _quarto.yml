@@ -7,6 +7,9 @@ project:
     - "!labs/keys"
     - "!resources"
     - "labs"
+
+execute: 
+  warning: false
     
 author: 
   name: Emma Fling
@@ -28,6 +31,8 @@ website:
         text: Lab 1
       - href: lab2.qmd
         text: Lab 2
+      - href: lab3.qmd
+        text: Lab 3
       - icon: github
         href: https://github.com/mikejohnson51/csu-523c-2026/
         aria-label: ESS 523c
