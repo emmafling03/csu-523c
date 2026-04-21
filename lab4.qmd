@@ -1,0 +1,453 @@
+---
+title: "Lab 4: Rasters & Remote Sensing"
+subtitle: 'ESS 523c: Environmental Data Science Applications'
+author:
+  - name: Emma Fling
+    email: efling@colostate.edu
+format: html
+editor: visual
+---
+
+# Palo Iowa Flooding
+
+## Set Up
+
+#### Libraries
+
+```{r}
+library(rstac) # STAC API
+library(terra) # Raster Data handling
+```
+
+```{r}
+library(sf) # Vector data processing
+library(mapview) # Rapid Interactive visualization
+library(RColorBrewer)
+```
+
+#### Step 1: Define AOI
+
+Get AOI
+
+```{r}
+palo <- AOI::geocode("Palo, Iowa", bbox = TRUE)
+```
+
+#### Step 2: Define temporal window
+
+```{r}
+# Flood occurred Sept 26, 2016; search Sept 24–29 for cloud-free imagery
+temporal_range <- "2016-09-24/2016-09-29"
+```
+
+View
+
+```{r}
+mapview::mapview(palo)
+```
+
+#### Step 3: Identifying the relevant images
+
+Connect to Microsoft Planetary Computer
+
+```{r}
+stac_query <- stac("https://planetarycomputer.microsoft.com/api/stac/v1") %>%
+  stac_search(
+    collections = "landsat-c2-l2",
+    datetime    = temporal_range,
+    bbox        = st_bbox(palo),
+    limit       = 1
+  ) %>%
+  get_request() %>%
+  items_sign(sign_planetary_computer())
+```
+
+```{r}
+stac_query
+```
+
+```{r}
+cat("Item ID:", stac_query$features[[1]]$id, "\n")
+```
+
+```{r}
+cat("Date:", stac_query$features[[1]]$properties$datetime, "\n")
+```
+
+```{r}
+cat("Cloud cover:", stac_query$features[[1]]$properties$`eo:cloud_cover`, "%\n")
+```
+
+```{r}
+assets_download(
+  items      = stac_query,
+  asset_names = c('coastal', 'blue', 'green', 'red', 'nir08', 'swir16'),
+  output_dir = 'data/',
+  overwrite  = TRUE
+)
+```
+
+List downloaded Landsat band files (TIF format)
+
+```{r}
+raster_files <- list.files(
+  path = "data/",
+  pattern = "*.TIF$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+```
+
+Sort to ensure consistent band order
+
+```{r}
+raster_files <- sort(raster_files)[1:6]
+```
+
+Stack into a single SpatRaster object
+
+```{r}
+landsat_stack <- rast(raster_files)
+band_names <- c('coastal', 'blue', 'green', 'red', 'nir08', 'swir16')
+landsat_stack <- setNames(landsat_stack, band_names)
+```
+
+```{r}
+landsat_stack
+```
+
+## Question 1: Data Access
+
+The stacked image has dimensions of 7801 rows, 7681 columns, and 6 bands. The coordinate reference system is WGS 84 / UTM Zone 15N (EPSG:32615). The cell resolution is 30 m × 30 m, meaning each pixel represents a 30-meter square on the ground.
+
+#### Step 5: Analyse the Images
+
+Transform AOI to match raster CRS (UTM zone 15N)
+
+```{r}
+palo_utm <- palo %>% 
+  st_transform(crs(landsat_stack))
+```
+
+Crop the full scene to study area
+
+```{r}
+landsat_crop <- crop(landsat_stack, palo_utm)
+```
+
+```{r}
+cat("\nCropped extent:\n")
+print(ext(landsat_crop))
+cat("Cropped dimensions:", dim(landsat_crop), "\n")
+```
+
+## Question 2: Visualization
+
+#### **Natural Color (RGB) — What the Human Eye Would See**
+
+This picture shows the image as it would look to the human eye, making it easy to identify major land features like rivers, roads, and urban areas.
+
+```{r}
+plotRGB(landsat_crop, r = 4, g = 3, b = 2, stretch = "lin", 
+        main = "Natural Color: Red-Green-Blue")
+```
+
+#### **Color Infrared (Vegetation)**
+
+This composite highlights vegetation in bright red because "healthy" plants strongly reflect near-infrared light. Water and urban areas appear darker, making it useful for distinguishing vegetation health and general land cover.
+
+```{r}
+plotRGB(landsat_crop, r = 5, g = 4, b = 3, stretch = "lin",
+        main = "Color Infrared: NIR-Red-Green\n(Bright red = healthy vegetation)")
+```
+
+#### **Water-Focused False Color**
+
+This combination makes water detection easier because water absorbs strongly in both NIR and SWIR bands, so flooded or open water areas appear very dark or distinct blue and black. It can be useful for mapping flood extent and separating water from moist soil or vegetation.
+
+```{r}
+plotRGB(landsat_crop, r = 5, g = 6, b = 4, stretch = "lin",
+        main = "Water Focus: NIR-SWIR1-Red\n(Dark blue = open water/flooding)")
+```
+
+#### **NDVI**
+
+This highlights vegetation health by comparing near-infrared and red reflectance, where healthy vegetation appears in higher values. Areas with little or no vegetation, such as water or bare soil appear darker which can make it useful for identifying vegetated vs. non-vegetated areas
+
+```{r}
+ndvi  <- (landsat_crop$nir08 - landsat_crop$red) / (landsat_crop$nir08 + landsat_crop$red)
+
+plot(ndvi, col = colorRampPalette(c("blue", "white", "red"))(256))
+```
+
+#### Normalized Difference Water Index (NDWI)
+
+This index makes surface water easy to see by comparing green and near-infrared reflectance, where water typically appears as high (bright) values. It provides a clear separation between flooded areas and dry land,and can be used to delineate flood extent.
+
+```{r}
+ndwi <- (landsat_crop$green - landsat_crop$nir08) /
+        (landsat_crop$green + landsat_crop$nir08)
+
+plot(ndwi,
+     col = colorRampPalette(c("brown", "white", "blue"))(256),
+     main = "NDWI: Water/Flood Detection\n(Blue = water, brown = dry land)")
+```
+
+## Question 3: Indeces and Thresholds
+
+#### Step 1: Raster Algebra
+
+##### Create Rasters
+
+```{r}
+ndvi
+```
+
+```{r}
+ndwi
+```
+
+MNDWI
+
+```{r}
+mndwi <- (landsat_crop$green - landsat_crop$swir16) /
+         (landsat_crop$green + landsat_crop$swir16)
+```
+
+WRI
+
+```{r}
+wri <- (landsat_crop$green + landsat_crop$red) /
+       (landsat_crop$nir08 + landsat_crop$swir16)
+```
+
+SWI
+
+```{r}
+swi <- 1 / sqrt(pmax(landsat_crop$blue - landsat_crop$swir16))
+```
+
+##### Combine into stacked object and rename
+
+```{r}
+water_stack <- c(ndvi, ndwi, mndwi, wri, swi)
+
+names(water_stack) <- c("NDVI", "NDWI", "MNDWI", "WRI", "SWI")
+```
+
+Plot
+
+```{r}
+plot(water_stack, col = colorRampPalette(c("blue", "white", "red"))(256))
+```
+
+All five maps show a similar overall pattern, with the river channel and surrounding low-lying (floodplain) areas appearing distinct from the rest of the landscape. The location of these featuresappear across all indices. However, the maps differ in how continuous or fragmented these areas appear, with some indices showing smoother, connected regions and others displaying scattered patches. There are also differences in contrast, where some maps show stronger separation between water and land while others appear more gradual.
+
+#### Step 2: Thresholding
+
+NDVI \<0 = Water
+
+```{r}
+ndvi_flood <- app(ndvi, function(x) ifelse(x < 0, 1, 0))
+```
+
+NDWI \> 0 = water
+
+```{r}
+ndwi_flood <- app(ndwi, function(x) ifelse(x > 0, 1, 0))
+```
+
+MNDWI \> 0 = water
+
+```{r}
+mndwi_flood <- app(mndwi, function(x) ifelse(x > 0, 1, 0))
+```
+
+WRI \> 1 = water
+
+```{r}
+wri_flood <- app(wri, function(x) ifelse(x > 1, 1, 0))
+```
+
+SWI \< 5 = water
+
+```{r}
+swi_flood <- app(swi, function(x) ifelse(x < 5, 1, 0))
+```
+
+##### Stack and Name
+
+```{r}
+flood_stack <- c(ndvi_flood, ndwi_flood, mndwi_flood, wri_flood, swi_flood)
+
+names(flood_stack) <- c("NDVI", "NDWI", "MNDWI", "WRI", "SWI")
+```
+
+##### Clean NA
+
+```{r}
+flood_stack <- app(flood_stack, function(x) ifelse(is.na(x), 0, x))
+```
+
+##### Plot
+
+```{r}
+plot(flood_stack, col = c("white", "blue"))
+```
+
+#### Step 3
+
+All five maps appear similar because the thresholding process converts each index into a binary classification, where pixels are simply labeled as water or non-water. As a result, the main river channel and nearby flooded areas are consistently identified across all maps. The similarities are strongest in the river, which is clearly delineated in every method. However, small differences exist in the extent and distribution of scattered flooded pixels away from the river, with some maps showing more isolated patches than others. These differences reflect how each index responds slightly differently to surrounding land cover, even though they capture the same overall flood pattern.
+
+## Question 4: Classification
+
+#### Step 1: Set Seed
+
+```{r}
+set.seed(123)
+```
+
+#### Step 2: Extract raster values
+
+```{r}
+vals <- values(landsat_crop)
+dim(vals)
+```
+
+This means 12,192 pixels were extracted, and each pixel has 6 spectral values, one from each band.
+
+```{r}
+vals_clean <- na.omit(vals)
+dim(vals_clean)
+```
+
+#### Step 3: Run k-means clustering
+
+Start with 12 clusters
+
+```{r}
+km12 <- kmeans(vals_clean, centers = 12)
+```
+
+```{r}
+km12$cluster
+```
+
+#### Step 4: Put clusters back into a raster
+
+Create a new raster object
+
+```{r}
+kmeans_raster <- landsat_crop[[1]]
+```
+
+```{r}
+all_vals <- values(landsat_crop)
+complete_cases <- complete.cases(all_vals)
+
+kmeans_raster[] <- NA
+kmeans_raster[complete_cases] <- km12$cluster
+```
+
+```{r}
+plot(kmeans_raster, main = "K-means Classification (k = 12)")
+```
+
+#### Step 5: Find which cluster is most associated with flooding
+
+Check values
+
+```{r}
+flood_vals <- values(ndwi_flood)
+cluster_vals <- values(kmeans_raster)
+```
+
+Create a logical index
+
+```{r}
+valid <- !is.na(flood_vals) & !is.na(cluster_vals)
+```
+
+Contingency table
+
+```{r}
+tab <- table(flood_vals[valid], cluster_vals[valid])
+tab
+```
+
+Flood row
+
+```{r}
+tab[2, ]
+```
+
+Find cluster with most flooded cells
+
+```{r}
+flood_cluster <- which.max(tab[2, ])
+flood_cluster
+```
+
+Extract flood mask
+
+```{r}
+kmeans_flood <- app(kmeans_raster, function(x) ifelse(x == flood_cluster, 1, 0))
+```
+
+Plot
+
+```{r}
+plot(kmeans_flood, col = c("white", "blue"),
+     main = "K-means Derived Flood Map")
+```
+
+Add it to the flood stack
+
+```{r}
+flood_stack2 <- c(flood_stack, kmeans_flood)
+names(flood_stack2) <- c("NDVI", "NDWI", "MNDWI", "WRI", "SWI", "KMEANS")
+```
+
+Plot the comparison
+
+```{r}
+plot(flood_stack2, col = c("white", "blue"))
+```
+
+## Question 5: Summary
+
+#### Step 1: Calculate flooded area for each method
+
+```{r}
+flood_counts <- global(flood_stack2, fun = "sum", na.rm = TRUE)
+print(flood_counts)
+
+
+res(flood_stack2)
+cell_area <- prod(res(flood_stack2))   
+cell_area
+
+flood_area <- flood_counts * cell_area
+print(flood_area)
+```
+
+#### Step 2: Sum the whole stack to show agreement/uncertainty
+
+```{r}
+flood_sum <- app(flood_stack2, sum, na.rm = TRUE)
+
+plot(flood_sum, col = brewer.pal(9, "Blues"),
+     main = "Flood Agreement Map")
+```
+
+#### Step 3: Set 0 values to NA and map with mapview
+
+```{r}
+flood_sum_map <- flood_sum
+flood_sum_map[flood_sum_map == 0] <- NA
+
+library(mapview)
+mapview(flood_sum_map)
+```
+
+Some cell values are not even numbers because the summed raster is counting how many of the six individual methods classified each pixel as flooded. A cell could be flooded by 1, 3, or 5 methods depending on how each index /classification responds to the spectral properties of that location. This produces both even and odd values in the final agreement raster.

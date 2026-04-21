@@ -1,0 +1,11 @@
+---
+title: "Home"
+author: "Emma Fling"
+subtitle: 'ESS 523c: Environmental Data Science Applications'
+format: html
+editor: visual
+---
+
+## Welcome
+
+This is the Github page for my ESS 523c Lab Submissions!
