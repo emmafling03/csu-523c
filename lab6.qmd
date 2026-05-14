@@ -1,0 +1,418 @@
+---
+title: "Lab 6: Timeseries Data"
+editor: visual
+---
+
+## Intro
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(climateR)
+
+library(dataRetrieval)
+library(terra)
+library(exactextractr)
+
+library(tidymodels)
+library(tsibble)
+library(feasts)
+library(modeltime)
+library(timetk)
+library(tseries)
+```
+
+## Getting the Data
+
+#### Streamflow
+
+```{r}
+poudre_flow <- readNWISdv(
+  siteNumber = "06752260",
+  parameterCd = "00060",
+  startDate   = "2013-01-01",
+  endDate     = "2023-12-31"
+) |>
+  renameNWISColumns() |>
+  mutate(Date = yearmonth(Date)) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow))
+```
+
+#### Historic Climate
+
+```{r}
+basin <- findNLDI(nwis = "06752260", find = "basin")
+
+sdate <- as.Date("2013-01-01")
+edate <- as.Date("2023-12-31")
+
+gm <- getTerraClim(
+  AOI       = basin$basin,
+  var       = c("tmax", "ppt", "srad"),
+  startDate = sdate,
+  endDate   = edate
+) |>
+  unlist() |>
+  rast() |>
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+historic <- mutate(gm, id = "gridmet") |>
+  pivot_longer(cols = -id) |>
+  mutate(name = sub("^mean\\.", "", name)) |>
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |>
+  mutate(index = as.integer(index)) |>
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |>
+  pivot_wider(id_cols = Date, names_from = var, values_from = value) |>
+  right_join(poudre_flow, by = "Date")
+
+# Validate: should have 132 rows (11 years × 12 months). If fewer, climate data
+# is missing for some months and those flow months were silently dropped.
+stopifnot("Climate join dropped flow months — check GridMET download" = nrow(historic) == 132)
+```
+
+#### Future Climate
+
+```{r}
+sdate <- as.Date("2024-01-01")
+edate <- as.Date("2033-12-31")
+
+maca <- getMACA(
+  AOI      = basin$basin,
+  var      = c("tasmax", "pr", "rsds"),
+  timeRes  = "month",
+  startDate = sdate,
+  endDate   = edate
+) |>
+  unlist() |>
+  rast() |>
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+future <- mutate(maca, id = "maca") |>
+  pivot_longer(cols = -id) |>
+  mutate(name = sub("^mean\\.", "", name)) |>
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |>
+  mutate(index = as.integer(index)) |>
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |>
+  pivot_wider(id_cols = Date, names_from = var, values_from = value)
+
+# Rename the 3 climate columns to match GridMET names (Date column stays first)
+stopifnot("Unexpected MACA column count" = ncol(future) == 4)
+names(future)[2:4] <- c("ppt", "srad", "tmax")  # order matches getMACA var request
+future <- mutate(future, tmax = tmax - 273.15)   # Kelvin → °C
+```
+
+## My Turn
+
+#### Convert to tsibble
+
+```{r}
+historic_ts <- historic |>
+  as_tsibble(index = Date)
+
+glimpse(historic_ts)
+```
+
+#### Plot the Time Series
+
+Flow Over Time
+
+```{r}
+historic_ts |>
+  ggplot(aes(x = Date, y = Flow)) +
+  geom_line(linewidth = 0.8, color = "steelblue") +
+  labs(
+    title = "Monthly Mean Flow: Cache la Poudre at Mouth",
+    x = "Date",
+    y = "Flow (cfs)"
+  ) +
+  theme_bw()
+```
+
+Interactive Flow Over Time
+
+```{r}
+historic_ts |>
+  as_tibble() |>
+  mutate(Date = as.Date(Date)) |>
+  plot_ly(
+    x = ~Date,
+    y = ~Flow,
+    type = "scatter",
+    mode = "lines",
+    line = list(color = "steelblue")
+  ) |>
+  layout(
+    title = "Interactive Monthly Mean Streamflow",
+    xaxis = list(title = "Date"),
+    yaxis = list(title = "Flow (cfs)")
+  )
+```
+
+#### Seasonal Diagnostics
+
+Subseries Plot
+
+```{r}
+gg_subseries(historic_ts, Flow) +
+  labs(
+    title = "Monthly Subseries Plot of Flow",
+    x = "Month",
+    y = "Flow (cfs)"
+  ) +
+  theme_bw()
+```
+
+Seasonal Plot
+
+```{r}
+gg_season(historic_ts, Flow) +
+  labs(
+    title = "Seasonal Plot of Monthly Flow",
+    x = "Month",
+    y = "Flow (cfs)"
+  ) +
+  theme_bw()
+```
+
+In these plots, the “seasons” are runoff period (April- Late June) and dry periods (July to Mid May). The seasonal shape is fairly consistent overall: flow is low in winter, starts rising in spring, peaks strongly in May–June, and then drops quickly by July. There is still noticeable year-to-year variation in the size of the peak, so the timing is fairly stable but has outliers such as September 2013 (when there was flooding). The large May–June peak is driven by spring snowmelt runoff from the mountain snowpack in the Cache la Poudre basin. Some years also show unusual late-summer or early spikes, likely from rain events, but these are much smaller and less consistent than the snowmelt peak.
+
+#### Stationary and Autocorrelation
+
+#### Check lag
+
+Lag Plot
+
+```{r}
+gg_lag(historic_ts, Flow) +
+  labs(
+    title = "Lag Plot of Monthly Flow",
+    x = "Lagged Flow",
+    y = "Current Flow"
+  ) +
+  theme_bw()
+```
+
+Stationary Test
+
+```{r}
+historic_ts <- historic |>
+  mutate(log_flow = log1p(Flow)) |>
+  as_tsibble(index = Date)
+
+flow_vec <- historic_ts |>
+  pull(log_flow)
+
+adf.test(flow_vec)
+kpss.test(flow_vec)
+```
+
+The formal tests give mixed but mostly non-stationary evidence. The ADF test has a p-value of 0.01, which suggests rejecting the null of non-stationarity, so based on ADF the series appears stationary. But the KPSS test has a p-value of 0.04001, which rejects the null of stationarity, so by KPSS the series appears non-stationary. I believe the series is not fully stationary, and ARIMA will likely need at least d = 1 differencing.
+
+The lag plot also supports that conclusion, as it shows strong autocorrelation, since points are not a random cloud. Since the structure is not a simple linear band and seasonal peaks dominate relationships, this can suggest the series has strong seasonal and flow-regime structure rather than a stable stationary process.
+
+#### Decomposition
+
+```{r}
+flow_decomp <- historic_ts |>
+  model(STL(log_flow ~ season(window = "periodic"))) |>
+  components()
+```
+
+```{r}
+autoplot(flow_decomp) +
+  labs(
+    title = "STL Decomposition of log(Flow + 1)",
+    y = "log(Flow + 1)"
+  ) +
+  theme_minimal()
+```
+
+The trend suggests that Poudre flow increased early in the time period, then declined after the mid-2010s, with a small rebound near the end. This may indicate some long-term reduction in flow consistent with climate pressure or stream allocation demand. The seasonal component is driven mainly by spring snowmelt with a strong May–June runoff peak, has a low winter flow due to precipitation being stored in the snowpack, and declining summer flows influenced by the end of snowmelt along with irrigation withdrawals and reservoir management. The remainder highlights years where flow was unusually high or low relative to the normal seasonal pattern, likely due to especially wet, dry, or fast melt conditions.
+
+## Model Time Prediction
+
+#### Data Preparation
+
+Convert Historic tsibble to plain tibble
+
+```{r}
+historic_tbl <- historic |>
+  as_tibble() |>
+  mutate(
+    Date = seq.Date(
+      from = as.Date("2013-01-01"),
+      by   = "month",
+      length.out = n()
+    ),
+    log_flow = log1p(Flow)
+  )
+
+glimpse(historic_tbl)
+```
+
+```{r}
+future_tbl <- future |>
+  as_tibble() |>
+  mutate(
+    Date = seq.Date(
+      from = as.Date("2024-01-01"),
+      by   = "month",
+      length.out = n()
+    )
+  )
+
+glimpse(future_tbl)
+```
+
+Check
+
+```{r}
+required_predictors <- c("Date", "ppt", "srad", "tmax")
+
+stopifnot(all(required_predictors %in% names(historic_tbl)))
+stopifnot(all(required_predictors %in% names(future_tbl)))
+```
+
+#### Train Test Split
+
+```{r}
+splits <- time_series_split(
+  historic_tbl,
+  assess = "24 months",
+  cumulative = TRUE
+)
+
+training <- training(splits)
+testing  <- testing(splits)
+```
+
+#### Model Definition
+
+```{r}
+mods <- list(
+  arima_reg() |>
+    set_engine("auto_arima"),
+
+  arima_boost(min_n = 2, learn_rate = 0.015) |>
+    set_engine("auto_arima_xgboost"),
+
+  prophet_reg() |>
+    set_engine("prophet"),
+
+  prophet_boost() |>
+    set_engine("prophet_xgboost")
+)
+```
+
+#### Model Fitting
+
+```{r}
+training_model <- training |>
+  select(-Flow)
+
+models <- map(
+  mods,
+  ~ fit(.x, log_flow ~ ., data = training_model)
+)
+
+models_tbl <- as_modeltime_table(models)
+```
+
+#### Calibration and Accuracy
+
+```{r}
+calibration_tbl <- models_tbl |>
+  modeltime_calibrate(
+    new_data = testing |> select(-Flow)
+  )
+
+accuracy_tbl <- calibration_tbl |>
+  modeltime_accuracy()
+```
+
+```{r}
+print(accuracy_tbl)
+```
+
+All four models outperform a naïve seasonal forecast because their MASE values are all below 1, so each model adds real predictive skill. The strongest model is ARIMA with XGBoost, which has the best values across most metrics: the lowest MAE (0.469), MAPE (14.50%), MASE (0.476), sMAPE (12.90), and RMSE (0.595), and the highest R² (0.831). Base ARIMA and base Prophet with regressors perform similarly, with ARIMA slightly better on most error metrics, while Prophet with XGBoost is the weakest model, with the highest errors and lowest R².
+
+Looking at the individual metrics, MAE shows ARIMA-boost has the smallest average error, MAPE suggests about 14–19% typical error but as mentioned in class, may be inflated in low-flow months, and RMSE shows ARIMA-boost handles large misses best, which is important for snowmelt peaks. R² also confirms ARIMA-boost explains the most variability. Comparing boosted versus base models, boosting improves ARIMA, so the nonlinear climate signal is useful.
+
+#### Forecast
+
+```{r}
+test_forecast_log <- calibration_tbl |>
+  modeltime_forecast(
+    new_data    = testing |> select(-Flow),
+    actual_data = historic_tbl |> select(Date, log_flow)
+  )
+
+test_forecast_cfs <- test_forecast_log |>
+  mutate(
+    .value   = expm1(.value),
+    .conf_lo = expm1(pmax(.conf_lo, 0)),
+    .conf_hi = expm1(.conf_hi)
+  )
+```
+
+```{r}
+print(test_forecast_log)
+```
+
+```{r}
+print(test_forecast_cfs)
+```
+
+The predictions track the general pattern of the observed flow during 2022–2023. The models capture the seasonal cycle (the low winter flows and the rise into early summer) but they are less accurate on the biggest runoff months. For example, in June 2023 the observed flow is about 1499 cfs, while predictions range from about 354-893 cfs, so the models underestimate the large peak. In contrast, for lower-flow months such as November 2022 and March 2023, several predictions are closer to the observed values.
+
+The confidence intervals are wide and genrally cover observed values, especially during the large flow months, which suggests the uncertainty bands are doing their job. There are not obvious discontinuities at the 2022 training–test boundary, but there is a noticeable shift from fitted historical values to out-of-sample forecasts. My takeaway is that the models reproduce the timing of seasonal behavior better than the exact magnitude of extreme snowmelt peaks.
+
+#### Refit to Full Data Set
+
+```{r}
+refit_tbl <- models_tbl |>
+  modeltime_refit(
+    data = historic_tbl |> select(-Flow)
+  )
+
+print(refit_tbl)
+```
+
+Refitting does change accuracy metrics, because the models are being trained on the largest dataset rather than evaluated on the test period. The purpose of refitting is to let each model use all available data from 2013–2023 before forecasting 2024–2033. The earlier accuracy metrics are still the best measure of true predictive performance, but refitting is done to improve the final future forecast by re-estimating model parameters with more data.
+
+#### Forecast into The Future (2024-2033)
+
+```{r}
+future_forecast_log <- refit_tbl |>
+  modeltime_forecast(
+    new_data = future_tbl,
+    actual_data = historic_tbl |> select(Date, log_flow)
+  )
+```
+
+```{r}
+future_pred_cfs <- future_forecast_log |>
+  filter(.key == "prediction") |>
+  mutate(.value = expm1(.value))
+
+if (".conf_lo" %in% names(future_pred_cfs)) {
+  future_pred_cfs <- future_pred_cfs |>
+    mutate(.conf_lo = expm1(pmax(.conf_lo, 0)))
+}
+
+if (".conf_hi" %in% names(future_pred_cfs)) {
+  future_pred_cfs <- future_pred_cfs |>
+    mutate(.conf_hi = expm1(.conf_hi))
+}
+
+future_pred_cfs
+```
+
+## Wrap-Up
+
+The models do not project identical futures. ARIMA-based models and Prophet-based models tended to preserve the seasonal pattern, with low winter flows and a spring snowmelt peak, but they diverge in the magnitude of some future peaks. For example, in June 2033 forecasts range from about 229 cfs for Prophet with XGBoost to about 413 cfs for Prophet with regressors, while the ARIMA models fall in between at about 251 cfs and 300 cfs. This difference reflects each models different assumptions with ARIMA relying more on repeating autocorrelation and seasonal structure, while Prophet can allow a more flexible trend and can produce more variable future trajectories.
+
+For forecast quality, I would recommend the ARIMA with XGBoost model for CWCB water-supply planning because it had the best test performance: MAE = 0.469, MAPE = 14.50%, MASE = 0.476, sMAPE = 12.90, RMSE = 0.595, and R² = 0.831. It also outperformed the base ARIMA, base Prophet, and Prophet with XGBoost, and appears to balance seasonal time-series structure with the added climate predictors best. Negative predictions should not be an issue here because fitting on log_flow=log1p(Flow) and back-transforming with expm1() keeps predictions positive but if a model produced negative flow, I would use the log-transformation in production.
+
+Since the MACA inputs are based on a specific emissions scenario, uncertainty in future temperature, precipitation, and radiation propagates directly into uncertainty in streamflow forecasts. These results are conditional forecasts due to them being based on a specific set of conditions, not exact predictions. Finally, the biggest path for improvement would be adding predictors that are more physically tied to runoff generation, such as snowpack/SWE (controls general total amount), upstream reservoir storage and release rules (can account for random increase in flow), and irrigation diversions (accounts for many diversion in the basin. Other factors such as municipality pipelines/withdrawls, releases from the CBT compact, and other industrial demands could help improve forecasting as well.

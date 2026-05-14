@@ -37,6 +37,8 @@ website:
         text: Lab 4
       - href: lab5.qmd
         text: Lab 5
+      - href: Lab 6
+        text: lab6.qmd
       - icon: github
         href: https://github.com/mikejohnson51/csu-523c-2026/
         aria-label: ESS 523c
